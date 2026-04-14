@@ -11,7 +11,8 @@
     "next": "14.2.5",
     "react": "^18",
     "react-dom": "^18",
-    "resend": "^3.2.0"
+    "resend": "^3.2.0",
+    "fast-xml-parser": "^4.3.6"
   },
   "devDependencies": {
     "@types/node": "^20",

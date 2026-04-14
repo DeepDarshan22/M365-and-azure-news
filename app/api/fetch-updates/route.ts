@@ -1,87 +1,115 @@
 import { NextResponse } from 'next/server'
+import { XMLParser } from 'fast-xml-parser'
 
-export const maxDuration = 60
+export const maxDuration = 30
 
-export async function POST() {
-  const apiKey = process.env.ANTHROPIC_API_KEY
-  if (!apiKey) {
-    return NextResponse.json({ error: 'ANTHROPIC_API_KEY is not set' }, { status: 500 })
-  }
+type Category = 'critical' | 'deprecation' | 'feature' | 'news'
 
-  const today = new Date().toDateString()
-
-  const prompt = `You are an expert Microsoft Cloud technology analyst. Today is ${today}.
-
-Use web search to find the LATEST real news about Azure and Microsoft 365. Prioritize items published in the last 30–60 days.
-
-You MUST respond with ONLY a valid JSON array. No markdown, no backticks, no explanation text. Just the raw JSON array starting with [ and ending with ].
-
-Find 14–18 items spread across these four categories:
-
-- "critical": Urgent actions IT admins MUST take. Examples: TLS/SSL version retirements, authentication protocol changes, MFA enforcement deadlines, required license upgrades, security patch mandates, breaking API changes.
-- "deprecation": Features, services, or APIs being retired or end-of-life'd, with specific deadlines where known.
-- "feature": New features or capabilities announced as GA or Public Preview in Azure or M365.
-- "news": Important general news about Azure, M365, Copilot, Entra, Intune, Exchange, Teams, SharePoint, etc.
-
-Include at least 3 critical items and 3 deprecation items with real deadlines.
-
-Each item MUST exactly match this JSON shape:
-{
-  "category": "critical" | "deprecation" | "feature" | "news",
-  "title": "concise title under 12 words",
-  "summary": "2-3 sentences explaining what this means for IT admins and what action to take if applicable",
-  "date": "e.g. Apr 2025",
-  "deadline": "e.g. Sep 30 2025 or null if not applicable",
-  "source": "e.g. Microsoft Tech Community, Azure Blog, M365 Message Center",
-  "url": "direct URL string or null"
+interface FeedItem {
+  category: Category
+  title: string
+  summary: string
+  date: string
+  deadline: string | null
+  source: string
+  url: string | null
+  _pubDate?: string
 }
 
-Respond with ONLY the JSON array. Nothing before or after it.`
+const RSS_FEEDS = [
+  { url: 'https://azure.microsoft.com/en-us/updates/feed/', source: 'Azure Updates' },
+  { url: 'https://azure.microsoft.com/en-us/blog/feed/', source: 'Azure Blog' },
+  { url: 'https://www.microsoft.com/en-us/microsoft-365/blog/feed/', source: 'Microsoft 365 Blog' },
+  { url: 'https://msrc.microsoft.com/blog/feed', source: 'Microsoft Security' },
+]
+
+function extractStr(val: unknown): string {
+  if (!val) return ''
+  if (typeof val === 'string') return val.trim()
+  if (typeof val === 'object' && val !== null) {
+    const obj = val as Record<string, unknown>
+    if ('__cdata' in obj) return String(obj.__cdata).trim()
+    if ('#text' in obj) return String(obj['#text']).trim()
+  }
+  return String(val).trim()
+}
+
+function stripHtml(html: string): string {
+  return html
+    .replace(/<[^>]*>/g, ' ')
+    .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&nbsp;/g, ' ')
+    .replace(/\s+/g, ' ').trim()
+}
+
+function categorize(title: string, desc: string): Category {
+  const text = `${title} ${desc}`.toLowerCase()
+  if (/deprecat|retir|end.of.life|\beol\b|end.of.support|sunset|discontinu|will.be.removed|shutting.down|no.longer.support/.test(text)) return 'deprecation'
+  if (/\bsecurity\b|vulnerab|\bcve-|\bpatch\b|critical|action.required|action.needed|breaking.change|\btls\b|\bssl\b|must.upgrade|mandatory|urgent|compliance.required|update.required|service.disruption/.test(text)) return 'critical'
+  if (/generally.available|public.preview|\bga\b|new.feature|announc|introduc|now.available|\bpreview\b|launched|releasing|rolling.out|new.capability/.test(text)) return 'feature'
+  return 'news'
+}
+
+function matchesMonth(pubDate: string, year: number, month: number): boolean {
+  if (!pubDate) return false
+  try {
+    const d = new Date(pubDate)
+    if (isNaN(d.getTime())) return false
+    return d.getFullYear() === year && d.getMonth() + 1 === month
+  } catch { return false }
+}
+
+function formatDate(pubDate: string): string {
+  try {
+    return new Date(pubDate).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })
+  } catch { return pubDate }
+}
+
+async function fetchFeed(feedUrl: string, source: string): Promise<FeedItem[]> {
+  try {
+    const res = await fetch(feedUrl, {
+      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; AzureM365Intel/1.0)' },
+      next: { revalidate: 0 },
+    })
+    if (!res.ok) return []
+    const xml = await res.text()
+    const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: '@_', cdataPropName: '__cdata', textNodeName: '#text' })
+    const parsed = parser.parse(xml)
+    const channel = parsed?.rss?.channel || parsed?.feed
+    if (!channel) return []
+    const rawItems = channel.item || channel.entry || []
+    const items = Array.isArray(rawItems) ? rawItems : rawItems ? [rawItems] : []
+
+    return items.map((item: Record<string, unknown>) => {
+      const title = extractStr(item.title)
+      const description = stripHtml(extractStr(item.description || item.summary || item.content || ''))
+      const pubDate = extractStr(item.pubDate || item.updated || item.published || '')
+      const link = extractStr(item.link || item.id || '')
+      const summary = description.length > 300 ? description.slice(0, 300) + '…' : description || title
+      return { category: categorize(title, description), title, summary, date: formatDate(pubDate), deadline: null, source, url: link || null, _pubDate: pubDate }
+    })
+  } catch { return [] }
+}
+
+export async function POST(req: Request) {
+  let body: { month?: string; year?: string } = {}
+  try { body = await req.json() } catch { return NextResponse.json({ error: 'Invalid request body' }, { status: 400 }) }
+
+  const year = parseInt(body.year || '')
+  const month = parseInt(body.month || '')
+  if (!year || !month || month < 1 || month > 12) return NextResponse.json({ error: 'Valid month and year required' }, { status: 400 })
 
   try {
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': apiKey,
-        'anthropic-version': '2023-06-01',
-      },
-      body: JSON.stringify({
-        model: 'claude-sonnet-4-20250514',
-        max_tokens: 4000,
-        tools: [{ type: 'web_search_20250305', name: 'web_search' }],
-        messages: [{ role: 'user', content: prompt }],
-      }),
-    })
-
-    if (!response.ok) {
-      const err = await response.text()
-      return NextResponse.json({ error: `Anthropic API error: ${err}` }, { status: 500 })
-    }
-
-    const data = await response.json()
-
-    // Extract all text blocks from the response
-    const textContent = (data.content as { type: string; text?: string }[])
-      .filter(b => b.type === 'text')
-      .map(b => b.text || '')
-      .join('')
-
-    // Find the JSON array in the response
-    const arrayMatch = textContent.match(/\[[\s\S]*\]/)
-    if (!arrayMatch) {
-      return NextResponse.json({ error: 'Could not parse response from AI. Try again.' }, { status: 500 })
-    }
-
-    const items = JSON.parse(arrayMatch[0])
-
-    if (!Array.isArray(items)) {
-      return NextResponse.json({ error: 'Invalid response format from AI.' }, { status: 500 })
-    }
-
-    return NextResponse.json({ items })
+    const results = await Promise.allSettled(RSS_FEEDS.map(f => fetchFeed(f.url, f.source)))
+    const allItems: FeedItem[] = results.flatMap(r => r.status === 'fulfilled' ? r.value : [])
+    const filtered = allItems
+      .filter(item => matchesMonth(item._pubDate || '', year, month))
+      .map(({ _pubDate: _, ...rest }) => rest)
+    const deduped = filtered.filter((item, idx, arr) => arr.findIndex(o => o.title === item.title) === idx)
+    const order: Record<Category, number> = { critical: 0, deprecation: 1, feature: 2, news: 3 }
+    const sorted = deduped.sort((a, b) => order[a.category] - order[b.category])
+    return NextResponse.json({ items: sorted })
   } catch (e: unknown) {
-    const msg = e instanceof Error ? e.message : 'Unknown error'
-    return NextResponse.json({ error: msg }, { status: 500 })
+    return NextResponse.json({ error: e instanceof Error ? e.message : 'Failed to fetch feeds' }, { status: 500 })
   }
 }
